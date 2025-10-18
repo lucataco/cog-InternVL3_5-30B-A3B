@@ -1,0 +1,28 @@
+# Configuration for Cog ⚙️
+# Reference: https://cog.run/yaml
+
+build:
+  # InternVL3.5-30B-A3B (MoE model) requires an A100 GPU
+  gpu: true
+  cuda: "12.4"
+
+  # a list of ubuntu apt packages to install
+  system_packages:
+    - "libglib2.0-0"
+    - "libsm6"
+    - "libxext6"
+    - "libxrender-dev"
+    - "libgomp1"
+    - "ffmpeg"
+
+  # python version in the form '3.11' or '3.11.4'
+  python_version: "3.11"
+
+  # path to a Python requirements.txt file
+  python_requirements: requirements.txt
+
+  # run:
+  #   - FLASH_ATTENTION_SKIP_CUDA_BUILD=TRUE pip install flash-attn --no-build-isolation
+
+# predict.py defines how predictions are run on your model
+predict: "predict.py:Predictor"
