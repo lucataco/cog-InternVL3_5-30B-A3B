@@ -6,8 +6,11 @@ import urllib.parse as _urllib_parse
 import torch
 from cog import BasePredictor, Input, Path
 from PIL import Image
-import base64
-import io
+import time
+import subprocess
+import cv2
+import numpy as np
+from typing import List
 from transformers import AutoProcessor, AutoModelForImageTextToText
 
 # Set HuggingFace to offline mode to prevent downloading remote code
@@ -15,7 +18,6 @@ from transformers import AutoProcessor, AutoModelForImageTextToText
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["HF_DATASETS_OFFLINE"] = "1"
-
 
 # Workaround: Cog's response serialization calls urllib.parse.unquote_plus on
 # filenames and may pass bytes under some environments, which raises a
@@ -60,22 +62,24 @@ except Exception:
     # If cog internals change or are unavailable, continue without patch
     pass
 
+MODEL_PATH = "checkpoints"
+MODEL_URL = "https://weights.replicate.delivery/default/OpenGVLab/InternVL3_5-30B-A3B-HF/model.tar"
+
+def download_weights(url, dest):
+    start = time.time()
+    print("downloading url: ", url)
+    print("downloading to: ", dest)
+    subprocess.check_call(["pget", "-xf", url, dest], close_fds=False)
+    print("downloading took: ", time.time() - start)
 
 class Predictor(BasePredictor):
     def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
+        # Download weights
+        if not os.path.exists(MODEL_PATH):
+            download_weights(MODEL_URL, MODEL_PATH)
         
-        # Set model path to local checkpoints
-        model_path = "./checkpoints"
-        
-        # Verify checkpoints exist
-        if not os.path.exists(model_path):
-            raise RuntimeError(
-                f"Model checkpoints not found at {model_path}. "
-                "Please ensure the model weights are downloaded to the checkpoints folder."
-            )
-        
-        print(f"Loading InternVL3.5-30B-A3B from {model_path}...")
+        print(f"Loading InternVL3.5-30B-A3B from {MODEL_PATH}...")
         print("Offline mode enabled - using only local model files")
         
         # Load the model using the standard transformers API
@@ -83,7 +87,7 @@ class Predictor(BasePredictor):
         # trust_remote_code=True is required for custom model architecture,
         # but with TRANSFORMERS_OFFLINE=1, it only loads from local files
         self.model = AutoModelForImageTextToText.from_pretrained(
-            model_path,
+            MODEL_PATH,
             torch_dtype=torch.bfloat16,
             # load_in_8bit=True,
             low_cpu_mem_usage=True,
@@ -93,7 +97,7 @@ class Predictor(BasePredictor):
         
         # Load processor (handles both image preprocessing and tokenization)
         self.processor = AutoProcessor.from_pretrained(
-            model_path,
+            MODEL_PATH,
             trust_remote_code=True,
             local_files_only=True,  # Explicitly enforce local files only
         )
@@ -103,22 +107,23 @@ class Predictor(BasePredictor):
 
     def predict(
         self,
-        image: str = Input(description="Input image path or data URL (inside container)"),
         prompt: str = Input(
-            description="Text prompt/question about the image",
+            description="Text prompt/question about the image(s) or video",
             default="Please describe this image in detail.",
         ),
-        additional_image_1: str = Input(
-            description="Optional second image for multi-image understanding",
-            default="",
+        images: Path = Input(
+            description="Input image(s) - can be a single image or multiple images as a list (for multi-image understanding)",
+            default=None,
         ),
-        additional_image_2: str = Input(
-            description="Optional third image for multi-image understanding",
-            default="",
+        video: Path = Input(
+            description="Input video file for video understanding (alternative to images)",
+            default=None,
         ),
-        additional_image_3: str = Input(
-            description="Optional fourth image for multi-image understanding",
-            default="",
+        max_frames: int = Input(
+            description="Maximum number of frames to extract from video (evenly spaced)",
+            default=8,
+            ge=1,
+            le=32,
         ),
         max_new_tokens: int = Input(
             description="Maximum number of tokens to generate",
@@ -161,42 +166,83 @@ class Predictor(BasePredictor):
         ),
     ) -> str:
         """Run a single prediction on the model"""
-        
-        try:
-            # Helper: open image from file path or data URL
-            def open_image_from_string(path_or_data: str) -> Image.Image:
-                value = path_or_data
-                if isinstance(value, (bytes, bytearray)):
-                    value = value.decode("utf-8", errors="replace")
-                s = str(value)
-                if s.startswith("data:"):
-                    # data URL format: data:<mime>;base64,<data>
-                    try:
-                        header, b64data = s.split(",", 1)
-                    except ValueError:
-                        raise ValueError("Invalid data URL for image input")
-                    binary = base64.b64decode(b64data, validate=False)
-                    return Image.open(io.BytesIO(binary)).convert("RGB")
-                # Treat as filesystem path
-                return Image.open(s).convert("RGB")
 
-            # Load images
-            images = []
-            
-            # Load primary image
-            img = open_image_from_string(image)
-            images.append(img)
-            
-            # Load additional images if provided
-            for additional_img in [additional_image_1, additional_image_2, additional_image_3]:
-                if additional_img:
-                    img = open_image_from_string(additional_img)
-                    images.append(img)
-            
-            print(f"Processing {len(images)} image(s)...")
-            
+        try:
+            # Validate that either images or video is provided
+            if images is None and video is None:
+                raise ValueError("Either 'images' or 'video' must be provided")
+
+            if images is not None and video is not None:
+                raise ValueError("Cannot provide both 'images' and 'video'. Please provide only one.")
+
+            # Helper: extract frames from video
+            def extract_video_frames(video_path: str, max_frames: int) -> List[Image.Image]:
+                """Extract evenly-spaced frames from a video file"""
+                cap = cv2.VideoCapture(str(video_path))
+
+                if not cap.isOpened():
+                    raise ValueError(f"Could not open video file: {video_path}")
+
+                # Get total number of frames
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+                if total_frames == 0:
+                    raise ValueError(f"Video file contains no frames: {video_path}")
+
+                # Calculate frame indices to extract (evenly spaced)
+                if total_frames <= max_frames:
+                    frame_indices = list(range(total_frames))
+                else:
+                    frame_indices = np.linspace(0, total_frames - 1, max_frames, dtype=int).tolist()
+
+                frames = []
+                for idx in frame_indices:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                    ret, frame = cap.read()
+
+                    if ret:
+                        # Convert BGR (OpenCV) to RGB (PIL)
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        pil_image = Image.fromarray(frame_rgb)
+                        frames.append(pil_image)
+                    else:
+                        print(f"Warning: Could not read frame at index {idx}")
+
+                cap.release()
+
+                if not frames:
+                    raise ValueError("No frames could be extracted from the video")
+
+                print(f"Extracted {len(frames)} frames from video")
+                return frames
+
+            # Load images or extract video frames
+            image_list = []
+
+            if video is not None:
+                # Process video
+                print(f"Processing video: {video}")
+                image_list = extract_video_frames(str(video), max_frames)
+            else:
+                # Process images
+                # Handle both single image and list of images
+                if isinstance(images, list):
+                    image_paths = images
+                else:
+                    image_paths = [images]
+
+                for img_path in image_paths:
+                    if img_path is not None:
+                        img = Image.open(str(img_path)).convert("RGB")
+                        image_list.append(img)
+
+            if not image_list:
+                raise ValueError("No images could be loaded")
+
+            print(f"Processing {len(image_list)} image(s)...")
+
             # Format the conversation based on number of images
-            if len(images) == 1:
+            if len(image_list) == 1:
                 # Single image
                 conversation = [
                     {
@@ -208,13 +254,14 @@ class Predictor(BasePredictor):
                     }
                 ]
             else:
-                # Multiple images
+                # Multiple images or video frames
                 content = []
-                for i in range(len(images)):
+                media_type = "Frame" if video is not None else "Image"
+                for i in range(len(image_list)):
                     content.append({"type": "image"})
-                    content.append({"type": "text", "text": f"Image-{i+1}"})
+                    content.append({"type": "text", "text": f"{media_type}-{i+1}"})
                 content.append({"type": "text", "text": f"\n{prompt}"})
-                
+
                 conversation = [
                     {
                         "role": "user",
@@ -243,11 +290,11 @@ Ensure that the thinking process is thorough but remains focused on the query. T
             text = self.processor.apply_chat_template(
                 conversation, tokenize=False, add_generation_prompt=True
             )
-            
+
             # Process the inputs (images + text)
             inputs = self.processor(
                 text=text,
-                images=images,
+                images=image_list,
                 return_tensors="pt",
             ).to(self.model.device)
             
