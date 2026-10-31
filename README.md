@@ -192,7 +192,9 @@ Try reducing `max_new_tokens` or ensure you're using an A100 GPU with sufficient
 
 ## License
 
-This project is released under the Apache 2.0 License, consistent with the original InternVL3.5 model.
+The code in this repository is licensed under the [Apache License 2.0](LICENSE).
+
+The model weights are not covered by this license. [OpenGVLab/InternVL3_5-30B-A3B-HF](https://huggingface.co/OpenGVLab/InternVL3_5-30B-A3B-HF) is released under the [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0) license.
 
 ## Citation
 
